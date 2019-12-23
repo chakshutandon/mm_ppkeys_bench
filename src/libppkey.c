@@ -3,7 +3,7 @@
 Node *head_registered_threads = NULL;
 
 /* Return the value of the PKRU register. */
-static unsigned int pkey_read (void) {
+static unsigned int pkey_read() {
   unsigned int result;
   __asm__ volatile (".byte 0x0f, 0x01, 0xee"
                     : "=a" (result) : "c" (0) : "rdx");
@@ -11,13 +11,13 @@ static unsigned int pkey_read (void) {
 }
 
 /* Overwrite the PKRU register with value. */
-static void pkey_write (unsigned int value) {
+static void pkey_write(unsigned int value) {
   __asm__ volatile (".byte 0x0f, 0x01, 0xef"
                     : : "a" (value), "c" (0), "d" (0));
 }
 
 /* Return the memory address of ppkeys. */
-static void *ppkru_get(void) {
+static void *ppkru_get() {
     uint64_t res;
     // PPKRU confounded with R15 register
     __asm__ volatile("movq %%r15, %0" : "=r"(res));
@@ -30,29 +30,37 @@ static void *ppkru_get(void) {
 }
 
 /* Update pkru with intersection of thread and process protection key. */
-static void thread_ppkey_update_pkru(uint32_t ppkey) {
+static inline void thread_ppkey_update_pkru(uint32_t ppkey) {
     unsigned int pkru = pkey_read();
     pkru = pkru | ppkey;
     pkey_write(pkru);
 }
 
 /* Handler to update thread PKRU register on SIGUSR1. */
-static void sig_handler(int signal, siginfo_t *info, void *unused) {
+static inline void sig_handler(int signal, siginfo_t *info, void *ucontext) {
+    printf("[sig_handler] PKRU: %d\n", pkey_read());
+    // BUG: thread_ppkey_update_pkru updating PKRU within context of signal handler and not
+    // calling thread. 
+    // struct ucontext_t ucontext contains context of calling thread including FPU registers but PKRU
+    // seems to be missing. Not sure how PKRU is "reset" from user stack on returning from signal handler. 
     thread_ppkey_update_pkru((uint32_t)info->si_int);
 }
 
 /* Register thread with PKRU update signal handler and insert into list of active threads. */
-int register_thread(pthread_t thread_id) {
+inline int register_thread() {
     struct sigaction sa;
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = sig_handler;
     
     sigaction(SIGUSR1, &sa, NULL);
+
+    pthread_t thread_id = pthread_self();
     head_registered_threads = insert_node(head_registered_threads, thread_id);
 }
 
 /* Unregister thread from receiving PKRU update signal. */
-int unregister_thread(pthread_t thread_id) {
+int unregister_thread() {
+    pthread_t thread_id = pthread_self();
     head_registered_threads = remove_node(head_registered_threads, thread_id);
 }
 
@@ -74,17 +82,19 @@ int ppkey_write(int key, unsigned int prot) {
         perror("ppkey_write");
         return -1;
     }
+
+    Node *ptr;
     struct ppkey_area *p = ppkru_get();
     
     unsigned int mask = 3 << (2 * key);
     prot = prot << (2 * key);
-
     p->ppkey = (p->ppkey & ~mask) | prot;
     
     union sigval value;
     value.sival_int = p->ppkey;
 
-    Node *ptr;
+    printf("[ppkey_write] PKRU: %d\n", pkey_read());
+
     /* Simulate PPKRU support using Intel MPK (PKRU); signal all registered threads */
     for (ptr = head_registered_threads; ptr; ptr = ptr->next)
         pthread_sigqueue(ptr->thread_id, SIGUSR1, value);
@@ -96,7 +106,6 @@ int ppkey_write(int key, unsigned int prot) {
 void print_ppkeys() {
     int i, k;
     struct ppkey_area *p = ppkru_get();
-
     if (!p) {
         errno = ENOTSUP;
         perror("ppkru_get");
